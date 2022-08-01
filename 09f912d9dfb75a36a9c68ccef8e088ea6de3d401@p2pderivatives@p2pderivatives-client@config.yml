@@ -1,0 +1,383 @@
+version: 2.1
+executors:
+  client-runner:
+    docker:
+      - image: cryptogarageinc/p2pderivatives-client-ci
+  client-browsers-runner:
+    docker:
+      - image: cryptogarageinc/p2pderivatives-client-ci:latest-browser
+  macos-packager:
+    macos:
+      xcode: 11.3.0
+    environment:
+      BUILD_ARG: -m
+      PKG_SUFFIX: dmg
+  win-packager:
+    docker:
+      - image: electronuserland/builder:wine
+    environment:
+      BUILD_ARG: -w
+      PKG_SUFFIX: exe
+  linux-packager:
+    docker:
+      - image: electronuserland/builder
+    environment:
+      BUILD_ARG: -l
+      PKG_SUFFIX: AppImage
+
+tag_only: &tag_only
+  filters:
+    tags:
+      only: /.*/
+    branches:
+      ignore: /.*/
+
+workflows:
+  lint-build-test:
+    jobs:
+      - dependencies:
+          name: dependencies-cache
+      - lint:
+          requires:
+            - dependencies-cache
+      - build:
+          requires:
+            - dependencies-cache
+      - jest-tests:
+          requires:
+            - build
+      - integration-tests:
+          context: github-packages-docker-credentials
+          requires:
+            - build
+      - integration-tests-separate:
+          requires:
+            - build
+      - consolidate-coverage:
+          requires:
+            - jest-tests
+            - integration-tests-separate
+            - integration-tests
+
+  tagged:
+    jobs:
+      - dependencies:
+          name: dependencies-no-cache
+          with-cache: false
+          run-preci: false
+          <<: *tag_only
+      - packaging:
+          name: macos-packaging
+          runner:
+            name: macos-packager
+          <<: *tag_only
+          requires:
+            - dependencies-no-cache
+      - packaging:
+          name: windows-packaging
+          runner:
+            name: win-packager
+          build-cfd-electron-args: --platform=win32
+          <<: *tag_only
+          requires:
+            - dependencies-no-cache
+      - packaging:
+          name: linux-packaging
+          runner:
+            name: linux-packager
+          <<: *tag_only
+          requires:
+            - dependencies-no-cache
+      - release:
+          context: github-release
+          <<: *tag_only
+          requires:
+            - linux-packaging
+            - windows-packaging
+            - macos-packaging
+
+jobs:
+  dependencies:
+    parameters:
+      run-preci:
+        description: 'Should run the preci hook ? (link global packages)'
+        type: boolean
+        default: true
+      with-cache:
+        description: 'Should cache the dependencies ?'
+        type: boolean
+        default: true
+    executor: client-runner
+    steps:
+      - checkout
+      - run:
+          name: Checkout submodules
+          command: |
+            git submodule update --init --recursive
+            git ls-tree HEAD p2pderivatives-proto | awk '{ print $3 }' > p2pd-proto-hash.txt
+
+      - when:
+          condition: << parameters.with-cache >>
+          steps:
+            - restore_cache:
+                keys:
+                  ## add vX-debug suffix when debugging cache
+                  - npm-deps-{{ .Branch }}-{{ checksum "package-lock.json" }}-v8
+      - run:
+          name: Install nodes modules
+          command: |
+            if [ -d "node_modules" ]; then
+              export HAS_NPM_CACHE="true"
+            fi
+            if << parameters.run-preci >>;then
+              npm run-script preci && (cd gen-grpc && npm run-script preci)
+            fi
+            if [ -z "$HAS_NPM_CACHE" ]; then
+              npm ci
+            fi
+      - when:
+          condition: << parameters.with-cache >>
+          steps:
+            - save_cache:
+                key: npm-deps-{{ .Branch }}-{{ checksum "package-lock.json" }}-v7
+                paths:
+                  - node_modules
+      - when:
+          condition: << parameters.with-cache >>
+          steps:
+            - restore_cache:
+                keys:
+                  - gen-grpc-deps-{{checksum "gen-grpc/package-lock.json"}}-{{checksum "p2pd-proto-hash.txt"}}-v7
+      - run:
+          name: Generate gen grpc
+          command: |
+            if ls gen-grpc/*.proto >/dev/null 2>&1; then
+              export HAS_GEN_GRPC_CACHE="true"
+            fi
+            if [ -z "$HAS_GEN_GRPC_CACHE" ]; then
+              cd gen-grpc && npm ci && npm run-script gen
+            fi
+      - when:
+          condition: << parameters.with-cache >>
+          steps:
+            - save_cache:
+                key: gen-grpc-deps-{{checksum "gen-grpc/package-lock.json"}}-{{checksum "p2pd-proto-hash.txt"}}-v8
+                paths:
+                  - gen-grpc
+                  - gen-grpc/node_modules
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  lint:
+    executor: client-runner
+    steps:
+      - attach_workspace:
+          at: .
+      - run: npm run lint:ci
+      - store_test_results:
+          path: ./reports/linter
+      - store_artifacts:
+          path: ./reports/linter
+
+  build:
+    executor: client-runner
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: build
+          command: npm run build # ci to false avoid linter warnings as errors
+
+  jest-tests:
+    executor: client-runner
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: ReBuild grpc for node
+          command: npm rebuild grpc --runtime=node
+      - run:
+          name: run jest test
+          command: npm run test:ci
+      - store_test_results:
+          path: ./reports/jest
+      - store_artifacts:
+          path: ./reports/jest
+      - persist_to_workspace:
+          root: .
+          paths: ./reports
+
+  integration-tests:
+    executor: client-runner
+    steps:
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Login to docker repository
+          command: |
+            echo "$DOCKER_HUB_PASS" | docker login ${DOCKER_HUB_URL} -u "$DOCKER_HUB_USER" --password-stdin
+      - attach_workspace:
+          at: .
+      - run:
+          name: Configure and start services
+          command: |
+            COMPOSE_PROJECT_NAME=integration
+            docker create \
+              -v oracle-key:/oracle-key \
+              -v oracle-config:/oracle-config \
+              -v server-config:/server-config \
+              -v server-scripts:/server-scripts \
+              -v bitcoind-config:/bitcoind-config \
+              -v bitcoind-scripts:/bitcoind-scripts \
+              -v bitcoind-vectors:/bitcoind-vectors \
+              -v reports:/reports \
+              -v dev:/dev \
+              --name helper alpine /bin/true
+            docker cp ./services/oracle/config/. helper:/oracle-config
+            docker cp ./services/oracle/key/. helper:/oracle-key
+            docker cp ./services/server/config/. helper:/server-config
+            docker cp ./services/server/scripts/. helper:/server-scripts
+            docker cp ./services/bitcoind/config/. helper:/bitcoind-config
+            docker cp ./services/bitcoind/scripts/. helper:/bitcoind-scripts
+            docker-compose -f docker-compose.yml -f docker-compose.ci.yml up -d
+      - run:
+          name: Wait for services availability
+          command: |
+            docker-compose -f docker-compose.yml -f docker-compose.ci.yml run dockerize \
+             -wait http://oracle:8080/asset \
+             -wait tcp://server:8080 \
+             -wait tcp://bitcoind:18443
+      - run:
+          name: Apply migration
+          command: |
+            # need additional permissions
+            docker-compose exec bitcoind /bin/sh -c "chown -R bitcoin /vectors"
+
+            ./services/seed-services.sh
+            echo "recovering generated test vectors"
+            docker cp helper:/bitcoind-vectors/. ./services/bitcoind/vectors
+            docker cp ./. helper:/dev
+
+      - run:
+          name: Run Integration tests
+          command: |
+            docker-compose -f docker-compose.yml -f docker-compose.ci.yml run dev \
+              npm run integration:ci
+      - run:
+          name: Recover tests results
+          command: |
+            docker cp  helper:/reports/. ./reports
+          when: always
+      - store_test_results:
+          path: ./reports
+      - persist_to_workspace:
+          root: .
+          paths: ./reports
+
+  integration-tests-separate:
+    executor: client-runner
+    parallelism: 4
+    steps:
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - attach_workspace:
+          at: .
+      - run:
+          name: Configure and start services
+          command: |
+            docker create \
+              -v bitcoind-config:/bitcoind-config \
+              -v reports:/reports \
+              -v dev:/dev \
+              --name helper alpine /bin/true
+            docker cp ./services/bitcoind/config/. helper:/bitcoind-config
+            docker cp ./. helper:/dev
+      - run:
+          name: Run Integration tests separate
+          command: |
+            for i in {1..18}; do echo "$i"; done > tests.txt
+            TESTNAME=$(circleci tests split tests.txt)
+            split="${TESTNAME//[$'\t\r\n']/ }"
+            npm run integration-separate:ci -- $split
+      - run:
+          name: Recover tests results
+          command: |
+            docker cp  helper:/reports/. ./reports
+          when: always
+      - store_test_results:
+          path: ./reports
+      - persist_to_workspace:
+          root: .
+          paths: ./reports
+
+  consolidate-coverage:
+    executor: client-runner
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Merge integration-separate coverage reports
+          command: |
+            npx istanbul-merge --out reports/coverage/integration-separate/coverage-final.json \
+              reports/coverage/integration-separate/**.json
+            npx istanbul report --include reports/coverage/integration-separate/coverage-final.json \
+              --dir reports/coverage/integration-separate/ html
+      - run:
+          name: Merge all coverage reports
+          command: |
+            npx istanbul-merge --out reports/coverage/coverage-all.json \
+              reports/coverage/integration-separate/coverage-final.json \
+              reports/coverage/integration/coverage-final.json \
+              reports/coverage/node/coverage-final.json \
+              reports/coverage/browser/coverage-final.json
+            npx istanbul report --include reports/coverage/coverage-all.json --dir reports/coverage/ html
+      - store_artifacts:
+          path: ./reports
+
+  packaging:
+    parameters:
+      runner:
+        type: executor
+      build-cfd-electron-args:
+        description: 'arguments run by rebuilding cfd librairies'
+        type: string
+        default: ''
+    executor: << parameters.runner >>
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Rebuild electron Cfd librairies
+          command: npm run build-native-cfd:electron << parameters.build-cfd-electron-args >>
+      - run:
+          name: Packaging
+          command: |
+            npm run dist -- ${BUILD_ARG}
+            mkdir pkg && cp dist/*.${PKG_SUFFIX}* pkg
+      - store_artifacts:
+          path: ./pkg
+      - persist_to_workspace:
+          root: .
+          paths:
+            - pkg
+
+  release:
+    docker:
+      - image: cimg/go:1.14.6
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install ghr command
+          command: go get github.com/tcnksm/ghr
+      - run:
+          name: Upload binaries to github release
+          command: |
+            ghr \
+            -u p2pderivatives \
+            -r p2pderivatives-client \
+            -replace \
+            ${CIRCLE_TAG} pkg/

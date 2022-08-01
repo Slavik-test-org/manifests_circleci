@@ -1,0 +1,53 @@
+# Golang CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-go/ for more details
+version: 2
+jobs:
+  library:
+    name: Action code lint and unit tests
+    docker:
+      - image: circleci/golang:1.15
+        environment:
+          GO111MODULE: "on"
+
+    working_directory: /go/src/github.com/sbracaloni/thread-safe-action
+    steps:
+      - checkout
+
+      # specify any bash command here prefixed with `run: `
+      - run:
+          name: Lint
+          command: go get golang.org/x/lint/golint && golint -set_exit_status ./...
+      - run:
+          name: Check Format
+          command: test -z $(gofmt -l .)
+      - run:
+          name: Run unit tests
+          command: go test -v ./...
+  examples:
+    name: Examples lint and contract tests
+    docker:
+      - image: circleci/golang:1.15
+        environment:
+          GO111MODULE: "on"
+
+    working_directory: /go/src/github.com/sbracaloni/thread-safe-action
+    steps:
+        - checkout
+
+        # specify any bash command here prefixed with `run: `
+        - run:
+            name: Lint
+            command: go get golang.org/x/lint/golint && golint -set_exit_status ./examples/...
+        - run:
+            name: Check Format
+            command: test -z $(gofmt -l ./examples)
+        - run:
+            name: Run contract tests
+            command: cd ./examples/subscriber && go test . -v
+workflows:
+  version: 2
+  validate:
+    jobs:
+      - library
+      - examples

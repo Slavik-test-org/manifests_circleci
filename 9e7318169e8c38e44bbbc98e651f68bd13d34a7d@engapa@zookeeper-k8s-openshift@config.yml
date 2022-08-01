@@ -1,0 +1,128 @@
+version: 2
+jobs:
+  docker:
+    docker:
+    - image: docker
+    steps:
+    - setup_remote_docker
+    - checkout
+    - run:
+        name: Docker login
+        command: |
+          docker login -u=${DOCKER_USERNAME} -p ${DOCKER_PASSWORD}
+    - run:
+        name: Install essentials
+        command: |
+          apk add --no-cache --virtual .build-deps make gcc
+    - run:
+        name: build, test and push images
+        command: |
+          if [ "$CIRCLE_BRANCH" == "master" ]; then
+              docker build -t ${DOCKER_USERNAME}/zookeeper:latest .;
+              docker push ${DOCKER_USERNAME}/zookeeper:latest;
+          else
+              make docker-build docker-test docker-push;
+          fi
+  k8s:
+    machine:
+      image: ubuntu-2004:202101-01
+    steps:
+      - checkout
+      - run:
+          name: update pkgs
+          command: sudo apt-get update && sudo apt-get install -f -y conntrack
+      - run:
+          name: install minikube and kubectl
+          command: make minikube-install
+      - run:
+          name: run minikube
+          command: make minikube-run
+      - run:
+          name: run zookeeper tests
+          command: make minikube-test
+      - run:
+          name: delete resources
+          command: make minikube-clean
+      - run:
+          name: run zookeeper tests persistent
+          command: make minikube-test-persistent
+      - run:
+          name: delete minikube
+          command: make minikube-delete
+  openshift:
+    machine:
+      image: ubuntu-2004:202101-01
+    steps:
+      - checkout
+      - run:
+          name: install oc
+          command: make oc-install
+      - run:
+          name: run local openshift cluster
+          command: make oc-cluster-run
+      - run:
+          name: run zookeeper tests
+          command: make oc-cluster-test
+      - run:
+          name: clean resources
+          command: make oc-clean-resources
+      - run:
+          name: run zookeeper persistent tests
+          command: make oc-cluster-test-persistent
+      - run:
+          name: delete local openshift cluster
+          command: make oc-cluster-clean
+  gh-tag-release:
+    docker:
+      - image: cibuilds/github:0.13
+    steps:
+      - checkout
+      - run:
+          name: Install essentials
+          command: |
+            apk add --no-cache --virtual .build-deps make gcc curl
+      - run:
+          name: Create a new tag
+          command: |
+            VERSION=v$(make version)
+            git tag -f ${VERSION}
+            git remote set-url origin https://${CIRCLE_PROJECT_USERNAME}:${GITHUB_TOKEN}@github.com/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}
+            git push -f --tags
+      - run:
+          name: Create a tag release on github
+          command: |
+            VERSION=v$(make version)
+            ghr -t ${GITHUB_TOKEN} -u ${CIRCLE_PROJECT_USERNAME} -r ${CIRCLE_PROJECT_REPONAME} -c ${CIRCLE_SHA1} -b "Zookeeper version ${VERSION}" -delete ${VERSION} ./k8s
+
+workflows:
+  version: 2
+  build:
+    jobs:
+    - docker:
+        filters:
+          branches:
+            only:
+              - /^\d+\.\d+$/
+              - master
+    - k8s:
+        requires:
+          - docker
+        filters:
+          branches:
+            only:
+              - /^\d+\.\d+$/
+    - openshift:
+        requires:
+          - docker
+        filters:
+          branches:
+            only:
+              - /^\d+\.\d+$/
+    - gh-tag-release:
+        requires:
+          - k8s
+          - openshift
+        filters:
+          branches:
+            only:
+              - /^\d+\.\d+$/

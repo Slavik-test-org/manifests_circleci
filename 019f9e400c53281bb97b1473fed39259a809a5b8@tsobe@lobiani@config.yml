@@ -1,0 +1,439 @@
+version: 2.1
+
+orbs:
+  docker: circleci/docker@1.0.1
+  kubernetes: circleci/kubernetes@0.11.0
+  sonarcloud: sonarsource/sonarcloud@1.0.2
+
+parameters:
+  check:
+    type: boolean
+    default: true
+  build_backend:
+    type: boolean
+    default: false
+  build_admin:
+    type: boolean
+    default: false
+  build_shopping:
+    type: boolean
+    default: false
+  test:
+    type: boolean
+    default: false
+
+commands:
+  with_gradle_cache:
+    description: |
+      Run a set of steps with gradle dependencies cached.
+      This command will first restore a cache of gradle dependencies, if one was
+      saved by a previous build. The provided `steps` will then be executed, and
+      if successful, then a fresh cache will be saved, if required.
+      The contents of the `~/.gradle` directory is cached, which will substantially
+      improve build times for projects with many dependencies.
+      The cache-key is generated from any files named `build.gradle` (can be overriden by `build_file` parameter)
+      that are present in the `working_directory`.
+    parameters:
+      steps:
+        type: steps
+      cache_key:
+        description: Add a custom suffix to your cache key in the event you need to work with multiple gradle caches.
+        type: string
+        default: 'v1'
+      build_file:
+        description: Override gradle build file name (for example with `build.gradle.kts`)
+        type: string
+        default: 'build.gradle'
+    steps:
+      - run:
+          name: Generate Cache Checksum
+          command: find . -name '<< parameters.build_file >>' | sort | xargs cat | shasum | awk '{print $1}' > /tmp/gradle_cache_seed
+      - restore_cache:
+          key: gradle-<< parameters.cache_key>>-{{ checksum "/tmp/gradle_cache_seed" }}-{{ checksum ".circleci/config.yml" }}
+      - steps: << parameters.steps >>
+      - save_cache:
+          paths:
+            - ~/.gradle/caches
+            - ~/.gradle/wrapper
+          key: gradle-<< parameters.cache_key>>-{{ checksum "/tmp/gradle_cache_seed" }}-{{ checksum ".circleci/config.yml" }}
+  save_gradle_test_results:
+    parameters:
+      dst_location:
+        type: string
+    steps:
+      - run:
+          name: Saving test results
+          command: |
+            mkdir -p ~/<< parameters.dst_location >>/junit/
+            find . -type f -regex ".*/build/test-results/.*xml" -exec cp {} ~/<< parameters.dst_location >>/junit/ \;
+          when: always
+      - store_test_results:
+          path: ~/<< parameters.dst_location >>
+  download_argocd_cli:
+    steps:
+      - run:
+          name: Downloading Argo CD CLI
+          command: |
+            # ARGOCD_AUTH_TOKEN env is expected by argocd
+            sudo curl -sSL -o /usr/local/bin/argocd $ARGOCD_CLI_DOWNLOAD_URL
+            sudo chmod +x /usr/local/bin/argocd
+
+jobs:
+  determine-workflow:
+    docker:
+      - image: &base_image cimg/base:stable
+    steps:
+      - checkout
+      - run:
+          name: Determining the workflow to execute next
+          command: .circleci/check.sh
+  build-app-backend-jar:
+    docker:
+      - image: cimg/openjdk:14.0.1
+    steps:
+      - checkout
+      - with_gradle_cache:
+          build_file: build.gradle.kts
+          steps:
+            - run:
+                name: Building and testing
+                command: cd app-backend && ./gradlew build
+            - run:
+                name: Running Sonar Analysis
+                command: cd app-backend && ./gradlew sonarqube
+      - persist_to_workspace:
+          root: app-backend/app
+          paths:
+            - build/libs/app-*.jar
+      - save_gradle_test_results:
+          dst_location: unit-test-results
+  build-and-publish-image:
+    parameters:
+      build_dir:
+        type: string
+      image:
+        type: string
+    executor: docker/docker
+    steps:
+      - setup_remote_docker
+      - checkout
+      - docker/check
+      - attach_workspace:
+          at: << parameters.build_dir >>
+      - docker/build:
+          path: << parameters.build_dir >>
+          image: sevteen/<< parameters.image >>
+      - docker/push:
+          digest-path: /tmp/<< parameters.image >>_img_digest.txt
+          image: sevteen/<< parameters.image >>
+      - persist_to_workspace:
+          root: /tmp
+          paths:
+            - << parameters.image >>_img_digest.txt
+      - run:
+          command: |
+            echo "Digest is: $(</tmp/<< parameters.image >>_img_digest.txt)"
+  build-admin:
+    docker:
+      - image: &node circleci/node:14.8.0
+    working_directory: ~/project/admin
+    steps:
+      - checkout:
+          path: ~/project
+      - run:
+          name: Generating auth_config.json
+          command: |
+            echo "{\"domain\": \"$AUTH0_DOMAIN\", \"clientId\": \"$AUTH0_CLIENT_ID\"}" > auth_config.json
+            cat auth_config.json
+      - run:
+          name: Installing npm dependencies
+          command: npm install
+      - run:
+          name: Running lint
+          command: npm run lint --no-fix
+      - run:
+          name: Running unit tests with coverage
+          command: |
+            export COLLECT_COVERAGE=true
+            export ADD_JUNIT_REPORTER=true
+            export JEST_JUNIT_OUTPUT_DIR=./reports/junit/
+            npm run test:unit
+      - store_test_results:
+          path: ./reports/junit
+      - store_artifacts:
+          path: ./reports/junit
+      - run:
+          name: Bundling the app
+          command: npm run build
+      - sonarcloud/scan
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+  build-shopping:
+    docker:
+      - image: *node
+    working_directory: ~/project/shopping
+    steps:
+      - checkout:
+          path: ~/project
+      - run:
+          name: Installing npm dependencies
+          command: npm install
+      - run:
+          name: Running lint
+          command: npm run lint
+      - run:
+          name: Running unit tests with coverage
+          command: |
+            export COLLECT_COVERAGE=true
+            export ADD_JUNIT_REPORTER=true
+            export JEST_JUNIT_OUTPUT_DIR=./reports/junit/
+            npm run test
+      - store_test_results:
+          path: ./reports/junit
+      - store_artifacts:
+          path: ./reports/junit
+      - run:
+          name: Bundling the app
+          command: npm run build
+      - sonarcloud/scan
+      - persist_to_workspace:
+          root: .
+          paths:
+            - ./*
+  trigger-test:
+    docker:
+      - image: &git alpine/git:v2.26.2
+    steps:
+      - checkout
+      - add_ssh_keys: &deploy_key
+          fingerprints:
+            - "1f:5a:0e:e6:50:c6:2d:e4:b8:45:bd:5d:bb:51:89:ad"
+      - attach_workspace:
+          at: /tmp
+      - run:
+          name: Replacing image version
+          command: |
+            export DIGEST_PATH=`ls /tmp/*_img_digest.txt`
+            export IMG_NAME=`cut -d @ -f 1 $DIGEST_PATH | cut -d / -f 2`
+            export IMG_HASH=`cut -d @ -f 2 $DIGEST_PATH`
+
+            echo "Replacing version for image $IMG_NAME"
+
+            sed -i "s#image: sevteen/${IMG_NAME}@.*#image: sevteen/${IMG_NAME}@${IMG_HASH} \# Modified by CI at `date`#g" \
+              infra-config/apps/lobiani/base/lobiani.yaml
+      - run:
+          name: Printing diff
+          command: git diff
+      - run:
+          name: Pushing changes
+          command: |
+            export DIGEST_PATH=`ls /tmp/*_img_digest.txt`
+            export IMG_NAME=`cut -d @ -f 1 $DIGEST_PATH | cut -d / -f 2`
+            export IMG_HASH=`cut -d @ -f 2 /tmp/*_img_digest.txt`
+            git config user.email "b.tsotsoria@gmail.com"
+            git config user.name "circleci"
+            git commit -am "[CI] Updated version for image $IMG_NAME to $IMG_HASH"
+            git pull --rebase
+            git push
+  setup-test-infra:
+    docker:
+      - image: &terraform hashicorp/terraform:1.0.0
+    steps:
+      - checkout
+      - run:
+          name: Setting up the test infrastructure
+          command: |
+            cd infra-config/terraform/test
+            terraform init -backend-config="token=${TF_API_TOKEN}"
+            terraform apply --auto-approve=true
+            terraform output | cut -d = -f 2 > cluster_endpoint.txt
+            cd - > /dev/null
+      - persist_to_workspace:
+          root: infra-config
+          paths:
+            - terraform/test/cluster_endpoint.txt
+      - store_artifacts:
+          path: infra-config/terraform/test/errored.tfstate
+  deploy-to-test-env:
+    docker:
+      - image: *base_image
+    steps:
+      - attach_workspace:
+          at: infra-config
+      - download_argocd_cli
+      - run:
+          name: Deploying app of apps to test environment
+          command: |
+            # Workaround for issue https://github.com/argoproj/argo-cd/issues/3896
+            argocd cluster list > /dev/null 2>&1 || true
+
+            export TEST_CLUSTER_ENDPOINT=`cat infra-config/terraform/test/cluster_endpoint.txt | sed -E 's/(^\s+|\s+$)//g'`
+            argocd app create test-apps --repo https://github.com/tsobe/lobiani \
+                --path infra-config/argocd/aoa --dest-namespace argocd \
+                --dest-server https://kubernetes.default.svc \
+                --revision $CIRCLE_SHA1 -l environment=test \
+                --helm-set spec.destination.server=$TEST_CLUSTER_ENDPOINT \
+                --values test-values.yaml \
+                --upsert
+      - run:
+          name: Syncing apps
+          command: |
+            argocd app sync test-apps
+            argocd app sync -l sync-phase=0,app.kubernetes.io/instance=test-apps
+            argocd app wait -l sync-phase=0,app.kubernetes.io/instance=test-apps
+            # Ugly hack to wait for cert-manager-webhook become "available" i.e. to workaround following issue when
+            # creating ClusterIssuers:
+            #   Internal error occurred: failed calling webhook "webhook.cert-manager.io": Post https://cert-manager-webhook.cert-manager.svc:443/mutate?timeout=30s:
+            #   dial tcp 10.245.148.127:443: connect: connection refused
+            sleep 20s
+            argocd app sync -l app.kubernetes.io/instance=test-apps
+            argocd app wait -l app.kubernetes.io/instance=test-apps
+  run-e2e-tests:
+    docker:
+      - image: cimg/openjdk:11.0.9
+    steps:
+      - checkout
+      - run:
+          name: Running e2e tests
+          command: |
+            cd e2e-tests && ./gradlew test \
+              -Dgeb.build.baseUrl=${TEST_ADMIN_BASE_URL}/ \
+              -Dtest.shopping.baseUrl=${TEST_SHOPPING_BASE_URL}/ \
+              -Dremote.webdriver.url=$REMOTE_WEBDRIVER_URL \
+              -Dremote.webdriver.acceptInsecure=true \
+              -Dtest.admin.user=$TEST_ADMIN_USER \
+              -Dtest.admin.password=$TEST_ADMIN_PASSWORD
+      - save_gradle_test_results:
+          dst_location: e2e-test-results
+  trigger-promotion:
+    docker:
+      - image: *git
+    steps:
+      - checkout
+      - add_ssh_keys:
+          <<: *deploy_key
+      - run:
+          name: Pushing to production branch
+          command: |
+            git fetch
+            git merge origin/production --no-edit
+            git push origin $CIRCLE_SHA1:production
+  setup-prod-infra:
+    docker:
+      - image: *terraform
+    steps:
+      - checkout
+      - run:
+          name: Setting up the production infrastructure
+          command: |
+            cd infra-config/terraform/prod
+            terraform init -backend-config="token=${TF_API_TOKEN}"
+            terraform apply --auto-approve=true
+            cd - > /dev/null
+      - store_artifacts:
+          path: infra-config/terraform/prod/errored.tfstate
+  deploy-to-prod-env:
+    docker:
+      - image: *base_image
+    steps:
+      - download_argocd_cli
+      - run:
+          name: Syncing apps
+          command: |
+            argocd app sync production-apps
+            argocd app sync -l app.kubernetes.io/instance=production-apps
+            argocd app wait -l app.kubernetes.io/instance=production-apps
+
+workflows:
+  check:
+    when: << pipeline.parameters.check >>
+    jobs:
+      - determine-workflow:
+          filters:
+            branches:
+              only:
+                - master
+  build-backend:
+    when: << pipeline.parameters.build_backend >>
+    jobs:
+      - build-app-backend-jar
+      - build-and-publish-image:
+          name: build-and-publish-app-backend-image
+          build_dir: app-backend/app
+          image: lobiani-app-backend
+          requires:
+            - build-app-backend-jar
+      - trigger-test:
+          requires:
+            - build-and-publish-app-backend-image
+  check-backend:
+    jobs:
+      - build-app-backend-jar:
+          filters:
+            branches:
+              only: /dependabot\/gradle\/app-backend.*/
+  build-admin:
+    when: << pipeline.parameters.build_admin >>
+    jobs:
+      - build-admin
+      - build-and-publish-image:
+          name: build-and-publish-admin-image
+          build_dir: admin
+          image: lobiani-admin
+          requires:
+            - build-admin
+      - trigger-test:
+          requires:
+            - build-and-publish-admin-image
+  check-admin:
+    jobs:
+      - build-admin:
+          filters:
+            branches:
+              only: /dependabot\/npm_and_yarn\/admin.*/
+  build-shopping:
+    when: << pipeline.parameters.build_shopping >>
+    jobs:
+      - build-shopping
+      - build-and-publish-image:
+          name: build-and-publish-shopping-image
+          build_dir: shopping
+          image: lobiani-shopping
+          requires:
+            - build-shopping
+      - trigger-test:
+          requires:
+            - build-and-publish-shopping-image
+  check-shopping:
+    jobs:
+      - build-shopping:
+          filters:
+            branches:
+              only: /dependabot\/npm_and_yarn\/shopping.*/
+  test:
+    when: << pipeline.parameters.test >>
+    jobs:
+      - setup-test-infra
+      - deploy-to-test-env:
+          requires:
+            - setup-test-infra
+      - run-e2e-tests:
+          requires:
+            - deploy-to-test-env
+      - trigger-promotion:
+          requires:
+            - run-e2e-tests
+  promote:
+    jobs:
+      - setup-prod-infra:
+          filters: &production_filter
+            branches:
+              only:
+                - production
+      - deploy-to-prod-env:
+          filters:
+            <<: *production_filter
+          requires:
+            - setup-prod-infra

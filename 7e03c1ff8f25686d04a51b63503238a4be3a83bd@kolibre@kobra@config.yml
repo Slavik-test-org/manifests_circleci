@@ -1,0 +1,98 @@
+version: 2.1
+
+jobs:
+  test-migrations-postgres:
+    docker:
+      - image: ruby:2.5.7
+        environment:
+          BUNDLER_VERSION: 2.0.2
+          DATABASE_URL: postgres://postgres:password@postgres:5432/kobra
+      - image: postgres:11
+        name: postgres
+        environment:
+          POSTGRES_PASSWORD: password
+    steps:
+      - checkout
+      - run:
+          name: Install bundler
+          command: gem install bundler
+      - run:
+          name: Install Ruby dependencies
+          command: bundle install
+      - run:
+          name: Set up DB
+          command: bundle exec rake db:create
+      - run:
+          name: Apply migrations
+          command: bundle exec rake db:migrate
+  test-migrations-mysql:
+    docker:
+      - image: ruby:2.5.7
+        environment:
+          BUNDLER_VERSION: 2.0.2
+          DATABASE_URL: mysql2://root:password@mysql:3306/kobra?pool=5
+      - image: mysql:8.0
+        name: mysql
+        command: --default-authentication-plugin=mysql_native_password
+        environment:
+          MYSQL_ROOT_PASSWORD: password
+          MYSQL_DATABASE: kobra
+    steps:
+      - checkout
+      - run:
+          name: Install bundler
+          command: gem install bundler
+      - run:
+          name: Install Ruby dependencies
+          command: bundle install
+      - run:
+          name: Set up DB
+          command: bundle exec rake db:create
+      - run:
+          name: Apply migrations
+          command: bundle exec rake db:migrate
+  test-migrations-sqlite:
+    docker:
+      - image: ruby:2.5.7
+        environment:
+          BUNDLER_VERSION: 2.0.2
+    steps:
+      - checkout
+      - run:
+          name: Install bundler
+          command: gem install bundler
+      - run:
+          name: Install Ruby dependencies
+          command: bundle install
+      - run:
+          name: Set up DB
+          command: bundle exec rake db:create
+      - run:
+          name: Apply migrations
+          command: bundle exec rake db:migrate
+  run-api-tests:
+    machine:
+      image: ubuntu-1604:201903-01
+    steps:
+      - checkout
+      - run:
+          name: Install frank testing tool
+          command: |
+            sudo curl -L git.io/frank -o /usr/local/bin/frank
+            sudo chmod 755 /usr/local/bin/frank
+      - run:
+          name: Run test cases
+          command: ./run-api-tests.sh # builds the docker image and runs tests
+
+workflows:
+  version: 2.1
+  build-test-and-push:
+    jobs:
+      - test-migrations-postgres
+      - test-migrations-mysql
+      - test-migrations-sqlite
+      - run-api-tests:
+          requires:
+            - test-migrations-postgres
+            - test-migrations-mysql
+            - test-migrations-sqlite

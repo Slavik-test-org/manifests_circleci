@@ -1,0 +1,120 @@
+version: 2.1
+jobs:
+  lint-rust:
+    docker:
+      - image: rust:latest
+    resource_class: small
+    steps:
+      - checkout
+
+      - run:
+          name: Print Rust Versions
+          command: rustc --version; cargo --version; rustup --version
+
+      - run:
+          name: Install Rust Format
+          command: rustup component add rustfmt
+
+      - run:
+          name: Test Formatting
+          command: cargo fmt -- --check
+  test-rust:
+    docker:
+      - image: rust:latest
+    resource_class: small
+    steps:
+      - checkout
+
+      - run:
+          name: Print Rust Versions
+          command: rustc --version; cargo --version; rustup --version
+
+      - restore_cache:
+          keys:
+            - v2-cargo-cache-{{ arch }}-{{ checksum "Cargo.lock" }}
+
+      - run:
+          name: Build
+          command: cargo build --locked --all-targets
+
+      - run:
+          name: Run Tests
+          command: cargo test --locked
+
+      - run:
+          name: Autoclean Cargo cache before storing
+          command: cargo-cache || (cargo install cargo-cache --force --git https://github.com/matthiaskrgr/cargo-cache.git --no-default-features --features ci-autoclean && cargo-cache)
+
+      - save_cache:
+          key: v2-cargo-cache-{{ arch }}-{{ checksum "Cargo.lock" }}
+          paths:
+            - /usr/local/cargo
+            - target/debug
+
+  bench:
+    docker:
+      - image: rust:latest
+    resource_class: medium
+    steps:
+      - checkout
+
+      - run:
+          name: Print Rust Versions
+          command: rustc --version; cargo --version; rustup --version
+
+      - restore_cache:
+          keys:
+            - v2-cargo-cache-{{ arch }}-{{ checksum "Cargo.lock" }}
+
+      - run: cd battlesnake-rs/
+      - restore_cache:
+          keys:
+            - v2-criterion-baseline
+
+      - run: cargo bench
+
+      - store_artifacts:
+          path: target/criterion
+          destination: criterion
+
+  profile:
+    docker:
+      - image: rust:latest
+    resource_class: medium
+    steps:
+      - checkout
+
+      - run:
+          name: Print Rust Versions
+          command: rustc --version; cargo --version; rustup --version
+
+      - restore_cache:
+          keys:
+            - v2-cargo-cache-{{ arch }}-{{ checksum "Cargo.lock" }}
+
+      - run: cd battlesnake-rs/
+      # - run: cargo bench --bench devin -- --profile-time 60
+      - run: cargo bench --bench hobbs -- --profile-time 60
+      # - run: cargo bench --bench a-prime -- --profile-time 60
+      - run: cargo bench --bench flood-fill -- --profile-time 60
+      - store_artifacts:
+          path: target/criterion
+          destination: criterion
+workflows:
+  version: 2
+  ci:
+    jobs:
+      - test-rust
+      - lint-rust
+      - profile:
+          filters:
+            branches:
+              only:
+                - main
+                - /.*profile.*/
+      - bench:
+          filters:
+            branches:
+              only:
+                - main
+                - /.*bench.*/
